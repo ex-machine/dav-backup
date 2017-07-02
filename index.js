@@ -177,11 +177,12 @@ function backupTar(davBaseUrl, options) {
 			});
 		} else {
 			// tar --create --gzip --absolute-names
-			const tarProcess = spawn('tar', ['--create', '--gzip', '--absolute-names', ...dirs], { stdio: ['ignore', 'pipe', 'inherit'] });
+			const tarProcess = spawn('tar', ['--create', '--gzip', '--absolute-names', '--warning=no-file-changed', '--warning=no-file-removed', ...dirs], { stdio: ['ignore', 'pipe', 'inherit'] });
 
 			tarProcess.on('error', reject);
 			tarProcess.on('exit', (code, _signal) => {
-				if (code) {
+				// ignore warnings
+				if (code > 1) {
 					const err = new Error(`Directory backup failed with code ${code}`);
 					err.backupFilename = backupFilename;
 					reject(err);
