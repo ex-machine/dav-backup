@@ -2,4 +2,4 @@
 
 'use strict';
 
-require('..')(process.argv);
+require('..')(process.argv.slice(2));
