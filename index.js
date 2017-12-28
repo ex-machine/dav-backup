@@ -4,7 +4,6 @@ const co = require('co');
 const got = require('got');
 const moment = require('moment');
 const spawn = require('cross-spawn');
-const tar = require('tar');
 const webdavFactory = require('webdav');
 const yargs = require('yargs');
 
@@ -37,7 +36,7 @@ module.exports = (args) => {
 		}
 	}
 
-	const { _: dirs, name, daysToKeep, retries, dav: davType, davDir, davLogin, davPass, mysqlDb, mongoDb } = options;
+	const { dirs, name, daysToKeep, retries, dav: davType, davDir, davLogin, davPass, mysqlDb, mongoDb } = options;
 
 	console.time('Execution time');
 
@@ -50,7 +49,7 @@ module.exports = (args) => {
 		process.exit(1);
 	}, TIMEOUT);
 
-	if (!dirs.length && !mysqlDb) {
+	if (!(dirs && dirs.length) && !mysqlDb && !mongoDb) {
 		console.log('No directories or databases to backup');
 		process.exit(1);
 	}
@@ -60,22 +59,22 @@ module.exports = (args) => {
 	const BACKUP_FILENAME_REGEXP = new RegExp(`^backup-${name}_(?:(mysql|mongo)-.+?_|)(\\d{4}-\\d{2}-\\d{2})_(\\d{2}-\\d{2}-\\d{2}-\\d{3})(?:\\.tgz|\\.tar(?:\\.gz|)|\\.sql(?:\\.gz|))$`);
 
 	co(function* () {
-		let dirContents;
+		let davDirContents;
 
-		const dirSegments = davDir.split('/').filter(Boolean);
+		const davDirSegments = davDir.split('/').filter(Boolean);
 		let i = 0;
 
 		do {
 			// start with no segment
-			const segmentedDir = '/' + dirSegments.slice(0, i).join('/');
+			const segmentedDavDir = '/' + davDirSegments.slice(0, i).join('/');
 
 			try {
-				dirContents = yield dav.getDirectoryContents(segmentedDir);
+				davDirContents = yield dav.getDirectoryContents(segmentedDavDir);
 			} catch (err) {
 				// create backup dir if doesn't exists
 				if (err.status === 404) {
-					console.log(`Creating directory: ${segmentedDir}`);
-					yield dav.createDirectory(segmentedDir);
+					console.log(`Creating directory: ${segmentedDavDir}`);
+					yield dav.createDirectory(segmentedDavDir);
 				} else if (err.status === 401) {
 					console.warn('Wrong credentials');
 					process.exit(1);
@@ -85,15 +84,15 @@ module.exports = (args) => {
 			}
 
 			i++;
-		} while (i <= dirSegments.length);
+		} while (i <= davDirSegments.length);
 
 		// delete older backups
-		if (daysToKeep) {
-			const obsoleteMoment = moment().subtract(daysToKeep, 'days');
+		if (daysToKeep > 0 && daysToKeep < Infinity) {
+			const obsoleteMoment = moment().subtract(moment.duration(daysToKeep, 'days').asMilliseconds(), 'ms');
 
-			for (const { type, lastmod, filename: filePath, basename } of dirContents) {
+			for (const { type, lastmod, filename: filePath, basename } of davDirContents) {
 				const lastModifiedMoment = moment(lastmod);
-				if (type === 'file' && BACKUP_FILENAME_REGEXP.test(basename) && lastModifiedMoment && lastModifiedMoment.isBefore(obsoleteMoment)) {
+				if (type === 'file' && BACKUP_FILENAME_REGEXP.test(basename) && lastModifiedMoment.isBefore(obsoleteMoment)) {
 					console.log(`Deleting old backup: ${filePath}`);
 					yield dav.deleteFile(filePath);
 				}
@@ -132,7 +131,7 @@ module.exports = (args) => {
 		}
 
 		// backup directories
-		if (dirs.length) {
+		if (dirs && dirs.length) {
 			yield* backup(backupTar);
 			console.log('Directory dump completed');
 		}
@@ -159,39 +158,28 @@ module.exports = (args) => {
 };
 
 function backupTar(davBaseUrl, options) {
-	const { _: dirs, name, nodeTar: isNodeTar, davDir, davLogin, davPass } = options;
+	const { dirs, excludeDirs, name, davDir, davLogin, davPass } = options;
 
 	const backupPromise = new Promise((resolve, reject) => {
 		const backupFilename = `backup-${name}_` + moment().format('YYYY-MM-DD_HH-mm-ss-SSS') + '.tgz';
-		let tarStream;
+		const excludeDirsArgs = (excludeDirs && excludeDirs.length)
+			? excludeDirs.map(dir => `--exclude="${dir}"`)
+			: [];
 
-		if (isNodeTar) {
-			tarStream = tar.create({
-				gzip: true,
-				preservePaths: true
-			}, dirs);
+		// tar --create --gzip --absolute-names
+		const tarProcess = spawn('tar', ['--create', '--gzip', '--absolute-names', '--warning=no-file-changed', '--warning=no-file-removed', ...excludeDirsArgs, ...dirs], { stdio: ['ignore', 'pipe', 'inherit'] });
 
-			tarStream.on('error', err => {
+		tarProcess.on('error', reject);
+		tarProcess.on('exit', (code, _signal) => {
+			// ignore warnings
+			if (code > 1) {
+				const err = new Error(`Directory backup failed with code ${code}`);
 				err.backupFilename = backupFilename;
 				reject(err);
-			});
-		} else {
-			// tar --create --gzip --absolute-names
-			const tarProcess = spawn('tar', ['--create', '--gzip', '--absolute-names', '--warning=no-file-changed', '--warning=no-file-removed', ...dirs], { stdio: ['ignore', 'pipe', 'inherit'] });
+			}
+		});
 
-			tarProcess.on('error', reject);
-			tarProcess.on('exit', (code, _signal) => {
-				// ignore warnings
-				if (code > 1) {
-					const err = new Error(`Directory backup failed with code ${code}`);
-					err.backupFilename = backupFilename;
-					reject(err);
-				}
-			});
-
-			tarStream = tarProcess.stdout;
-		}
-
+		const tarStream = tarProcess.stdout;
 		const credentials = new Buffer(`${davLogin}:${davPass}`).toString('base64');
 		const putUrl = `${davBaseUrl}${davDir}/${backupFilename}`;
 
@@ -364,13 +352,22 @@ function parseOptions(args) {
 		type: 'string',
 		check: name => /^[a-z0-9]+$/i.test(name),
 		demandOption: true,
-		desc: 'alphanumeric'
+		desc: 'Alphanumeric'
 	})
-	.option('nodeTar', { type: 'boolean' })
-	.option('daysToKeep', { type: 'number' })
+	.option('daysToKeep', {
+		type: 'number',
+		default: Infinity
+	})
 	.option('retries', {
 		type: 'number',
 		default: 1
+	})
+	.option('dirs', {
+		type: 'array'
+	})
+	.option('excludeDirs', {
+		type: 'array',
+		implies: 'dirs'
 	})
 	.option('dav', {
 		type: 'string',
@@ -432,8 +429,6 @@ function parseOptions(args) {
 		type: 'number',
 		implies: 'mongoDb'
 	})
-
-	.option('_', { type: 'string' })
 	.help()
 	.argv;
 
